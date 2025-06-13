@@ -65,6 +65,7 @@ async def get_datanodes_link(session, download_url):
             # URL decode the link if it exists
             if url:
                 url = unquote(url)
+                url = url.replace('\n','')
             return url
         return None
 
