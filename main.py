@@ -30,8 +30,9 @@ async def get_fuckingfast_link(session, download_url):
         scripts = soup.find_all("script")
         pattern = re.compile(r'https://fuckingfast.co/dl/[a-zA-Z0-9_-]+')
         for script in scripts:
-            if script.string:
-                match = pattern.search(script.string)
+            script_text = script.get_text()
+            if script_text:
+                match = pattern.search(script_text)
                 if match:
                     return match.group()
     return None
@@ -46,7 +47,7 @@ async def get_datanodes_link(session, download_url):
         "file_code": file_code,
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.5",
         "Referer": "https://datanodes.to/",
@@ -62,6 +63,7 @@ async def get_datanodes_link(session, download_url):
     form.add_field("method_free", "Free Download >>")
     form.add_field("method_premium", "")
     form.add_field("__dl", "1")
+    form.add_field("g_captch__a", "1")
 
     async with session.post(
         "https://datanodes.to/download",
