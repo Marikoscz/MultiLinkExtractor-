@@ -3,7 +3,7 @@ import re
 import ctypes
 import asyncio
 import platform
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import time
 import aiohttp
 from bs4 import BeautifulSoup
@@ -11,7 +11,7 @@ import json
 from datetime import datetime
 from colorama import init, Fore, Style
 from urllib.parse import unquote
-
+from curl_cffi.requests import AsyncSession
 
 init(autoreset=True)  # Initialize colorama
 
@@ -23,18 +23,63 @@ def set_console_title(title):
         print(f"\33]0;{title}\a", end="", flush=True)
 
 async def get_fuckingfast_link(session, download_url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-    async with session.get(download_url, headers=headers) as response:
-        response_text = await response.text()
-        soup = BeautifulSoup(response_text, "html.parser")
-        scripts = soup.find_all("script")
-        pattern = re.compile(r'https://fuckingfast.co/dl/[a-zA-Z0-9_-]+')
-        for script in scripts:
-            script_text = script.get_text()
-            if script_text:
-                match = pattern.search(script_text)
-                if match:
-                    return match.group()
+
+    download_url = download_url.strip()
+    if not download_url:
+        return None
+
+    try:
+        async with AsyncSession(impersonate="chrome") as cf_session:
+            response = await cf_session.get(download_url, timeout=15)
+            
+            if response.status_code != 200:
+                return None
+                
+            html = response.text
+            
+            match = re.search(r'window\.open\("(https://dl\.fuckingfast\.co/dl/[^"]+)"\)', html)
+            if match:
+                return match.group(1)
+                
+            htmx_match = re.search(r'hx-(?:post|get)="([^"]+)"', html)
+            
+            if not htmx_match:
+                file_id_match = re.search(r'fuckingfast\.co/(?:f/)?([a-zA-Z0-9]+)', download_url)
+                if file_id_match:
+                    endpoint_path = f"/f/{file_id_match.group(1)}/go"
+                else:
+                    endpoint_path = None
+            else:
+                endpoint_path = htmx_match.group(1)
+
+            if endpoint_path:
+                endpoint_url = urljoin(download_url, endpoint_path)
+                headers = {
+                    "HX-Request": "true",
+                    "HX-Current-URL": download_url,
+                    "Referer": download_url,
+                }
+                
+                is_get = "hx-get" in (htmx_match.group(0).lower() if htmx_match else "")
+                
+                if is_get:
+                    api_resp = await cf_session.get(endpoint_url, headers=headers, timeout=15, allow_redirects=False)
+                else:
+                    api_resp = await cf_session.post(endpoint_url, headers=headers, timeout=15, allow_redirects=False)
+
+                direct_link = api_resp.headers.get("hx-redirect") or api_resp.headers.get("HX-Redirect") or api_resp.headers.get("location") or api_resp.headers.get("Location")
+                
+                if not direct_link and api_resp.text:
+                    dl_match = re.search(r'(https://dl\.fuckingfast\.co/dl/[^"\s\'<>]+)', api_resp.text)
+                    if dl_match:
+                        direct_link = dl_match.group(1)
+                
+                if direct_link:
+                    return direct_link
+                    
+    except Exception as e:
+        pass
+        
     return None
 
 async def get_datanodes_link(session, download_url):
