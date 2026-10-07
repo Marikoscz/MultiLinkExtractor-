@@ -83,48 +83,102 @@ async def get_fuckingfast_link(session, download_url):
     return None
 
 async def get_datanodes_link(session, download_url):
-    parsed_url = urlparse(download_url)
-    path_segments = parsed_url.path.split("/")
-    file_code = path_segments[1].encode("latin-1", "ignore").decode("latin-1")
-    file_name = path_segments[-1].encode("latin-1", "ignore").decode("latin-1")
-    cookies = {
-        "lang": "english",
-        "file_code": file_code,
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://datanodes.to/",
-        "Origin": "https://datanodes.to",
-        "Connection": "keep-alive",
-    }
-
-    form = aiohttp.FormData()
-    form.add_field("op", "download2")
-    form.add_field("id", file_code)
-    form.add_field("rand", "")
-    form.add_field("referer", "")
-    form.add_field("method_free", "Free Download >>")
-    form.add_field("method_premium", "")
-    form.add_field("__dl", "1")
-    form.add_field("g_captch__a", "1")
-
-    async with session.post(
-        "https://datanodes.to/download",
-        data=form,
-        headers=headers,
-        cookies=cookies,
-        allow_redirects=False,
-    ) as response:
-        if response.status == 200:
-            try:
-                data = await response.json()
-                url = data.get("url")
-                return unquote(url) if url else None
-            except Exception:
-                return None
+    download_url = download_url.strip()
+    if not download_url:
         return None
+
+    def normalize_link(url, base_url):
+        if not url:
+            return None
+        url = unquote(url.strip().strip("'\""))
+        if url.startswith("//"):
+            return f"https:{url}"
+        if url.startswith("/"):
+            return urljoin(base_url, url)
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        return None
+
+    def extract_link_from_text(text, base_url):
+        if not text:
+            return None
+        patterns = [
+            r'"url"\s*:\s*"([^"]+)"',
+            r"window\.location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]",
+            r"href=['\"]([^'\"]+)['\"][^>]*>\s*(?:Download|Click here)\s*<",
+            r"(https?://[^\s\"'<>]+)",
+        ]
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                candidate = normalize_link(match, base_url)
+                if candidate and not candidate.lower().startswith("javascript:"):
+                    return candidate
+        return None
+
+    parsed_url = urlparse(download_url)
+    path_segments = [segment for segment in parsed_url.path.split("/") if segment]
+    fallback_file_code = path_segments[0] if path_segments else ""
+
+    try:
+        async with AsyncSession(impersonate="chrome") as cf_session:
+            page_response = await cf_session.get(download_url, timeout=20)
+            if page_response.status_code != 200:
+                return None
+
+            html = page_response.text
+            immediate_link = extract_link_from_text(html, download_url)
+            if immediate_link:
+                return immediate_link
+
+            soup = BeautifulSoup(html, "html.parser")
+            form = soup.find("form")
+            if not form:
+                return None
+
+            payload = {}
+            for input_field in form.find_all("input"):
+                name = input_field.get("name")
+                if name:
+                    payload[name] = input_field.get("value", "")
+
+            payload.setdefault("op", "download2")
+            payload.setdefault("id", fallback_file_code)
+            payload.setdefault("rand", "")
+            payload.setdefault("referer", "")
+            payload.setdefault("method_free", "Free Download >>")
+            payload.setdefault("method_premium", "")
+            payload.setdefault("__dl", "1")
+
+            wait_match = re.search(r"var\s+(?:seconds|sec)\s*=\s*(\d+)", html, flags=re.IGNORECASE)
+            if wait_match:
+                wait_seconds = min(int(wait_match.group(1)), 15)
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds + 1)
+
+            form_action = form.get("action") or download_url
+            form_url = urljoin(download_url, form_action)
+            origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            headers = {
+                "Accept": "*/*",
+                "Referer": download_url,
+                "Origin": origin,
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            response = await cf_session.post(form_url, data=payload, headers=headers, timeout=20, allow_redirects=False)
+
+            location = response.headers.get("location") or response.headers.get("Location")
+            direct_link = normalize_link(location, download_url)
+            if direct_link:
+                return direct_link
+
+            body_link = extract_link_from_text(response.text, download_url)
+            if body_link:
+                return body_link
+    except Exception:
+        return None
+
+    return None
 
 async def process_links(urls):
     async with aiohttp.ClientSession() as session:
