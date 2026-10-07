@@ -91,6 +91,7 @@ async def get_datanodes_link(session, download_url):
         if not url:
             return None
         url = unquote(url.strip().strip("'\""))
+        url = url.replace("\\/", "/")
         if url.startswith("//"):
             return f"https:{url}"
         if url.startswith("/"):
@@ -99,12 +100,41 @@ async def get_datanodes_link(session, download_url):
             return url
         return None
 
+    def extract_link_from_dict(data, base_url):
+        if not isinstance(data, dict):
+            return None
+        candidate_keys = [
+            "url",
+            "link",
+            "download_url",
+            "download",
+            "redirect",
+            "location",
+            "href",
+            "file",
+            "result",
+        ]
+        for key in candidate_keys:
+            value = data.get(key)
+            if isinstance(value, str):
+                candidate = normalize_link(value, base_url)
+                if candidate and "datanodes.to" not in candidate.lower():
+                    return candidate
+            elif isinstance(value, dict):
+                nested = extract_link_from_dict(value, base_url)
+                if nested:
+                    return nested
+        return None
+
     def extract_link_from_text(text, base_url):
         if not text:
             return None
         patterns = [
             r'"url"\s*:\s*"([^"]+)"',
+            r'"(?:link|download_url|href|redirect|location)"\s*:\s*"([^"]+)"',
             r"window\.location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]",
+            r"(?:window\.)?open\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            r"href=['\"]([^'\"]+)['\"][^>]*>\s*(?:Download|Click here|Continue)\s*<",
             r"href=['\"]([^'\"]+)['\"][^>]*>\s*(?:Download|Click here)\s*<",
             r"(https?://[^\s\"'<>]+)",
         ]
@@ -112,12 +142,58 @@ async def get_datanodes_link(session, download_url):
             for match in re.findall(pattern, text, flags=re.IGNORECASE):
                 candidate = normalize_link(match, base_url)
                 if candidate and not candidate.lower().startswith("javascript:"):
+                    if "datanodes.to" not in candidate.lower():
+                        return candidate
+
+        try:
+            json_match = re.search(r"(?s)\{.*\}", text)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                candidate = extract_link_from_dict(data, base_url)
+                if candidate:
                     return candidate
+        except Exception:
+            pass
+
         return None
 
     parsed_url = urlparse(download_url)
     path_segments = [segment for segment in parsed_url.path.split("/") if segment]
     fallback_file_code = path_segments[0] if path_segments else ""
+
+    def build_headers(origin, referer):
+        return {
+            "Accept": "text/html,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": origin,
+            "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+    def extract_from_response(response, base_url):
+        location = (
+            response.headers.get("location")
+            or response.headers.get("Location")
+            or response.headers.get("hx-redirect")
+            or response.headers.get("HX-Redirect")
+        )
+        direct = normalize_link(location, base_url)
+        if direct and "datanodes.to" not in direct.lower():
+            return direct
+
+        body_link = extract_link_from_text(response.text, base_url)
+        if body_link:
+            return body_link
+
+        try:
+            data = response.json()
+            dict_link = extract_link_from_dict(data, base_url)
+            if dict_link:
+                return dict_link
+        except Exception:
+            pass
+        return None
 
     try:
         async with AsyncSession(impersonate="chrome") as cf_session:
@@ -131,7 +207,14 @@ async def get_datanodes_link(session, download_url):
                 return immediate_link
 
             soup = BeautifulSoup(html, "html.parser")
-            form = soup.find("form")
+            form = None
+            for candidate_form in soup.find_all("form"):
+                names = {i.get("name", "").lower() for i in candidate_form.find_all("input")}
+                if "op" in names or "method_free" in names or "id" in names:
+                    form = candidate_form
+                    break
+            if form is None:
+                form = soup.find("form")
             if not form:
                 return None
 
@@ -145,7 +228,7 @@ async def get_datanodes_link(session, download_url):
             payload.setdefault("id", fallback_file_code)
             payload.setdefault("rand", "")
             payload.setdefault("referer", "")
-            payload.setdefault("method_free", "Free Download >>")
+            payload.setdefault("method_free", "Free Download")
             payload.setdefault("method_premium", "")
             payload.setdefault("__dl", "1")
 
@@ -158,23 +241,38 @@ async def get_datanodes_link(session, download_url):
             form_action = form.get("action") or download_url
             form_url = urljoin(download_url, form_action)
             origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            headers = {
-                "Accept": "*/*",
-                "Referer": download_url,
-                "Origin": origin,
-                "X-Requested-With": "XMLHttpRequest",
-            }
 
-            response = await cf_session.post(form_url, data=payload, headers=headers, timeout=20, allow_redirects=False)
+            method_free_values = [
+                payload.get("method_free") or "Free Download",
+                "Free Download",
+                "Free Download >>",
+                "Slow Download",
+                "",
+            ]
+            seen = set()
+            for method_free_value in method_free_values:
+                if method_free_value in seen:
+                    continue
+                seen.add(method_free_value)
+                payload_try = dict(payload)
+                payload_try["method_free"] = method_free_value
 
-            location = response.headers.get("location") or response.headers.get("Location")
-            direct_link = normalize_link(location, download_url)
-            if direct_link:
-                return direct_link
+                for endpoint in [form_url, download_url]:
+                    response = await cf_session.post(
+                        endpoint,
+                        data=payload_try,
+                        headers=build_headers(origin, download_url),
+                        timeout=20,
+                        allow_redirects=False,
+                    )
+                    extracted = extract_from_response(response, download_url)
+                    if extracted:
+                        return extracted
 
-            body_link = extract_link_from_text(response.text, download_url)
-            if body_link:
-                return body_link
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirected = normalize_link(response.headers.get("Location"), download_url)
+                        if redirected and "datanodes.to" not in redirected.lower():
+                            return redirected
     except Exception:
         return None
 
